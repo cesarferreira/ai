@@ -138,19 +138,39 @@ impl Config {
     }
 
     fn config_path() -> PathBuf {
+        Self::config_dir().join("config.yaml")
+    }
+
+    fn legacy_json_path() -> PathBuf {
         Self::config_dir().join("config.json")
     }
 
     fn load() -> Self {
-        let path = Self::config_path();
-        if path.exists() {
-            fs::read_to_string(&path)
-                .ok()
-                .and_then(|content| serde_json::from_str(&content).ok())
-                .unwrap_or_default()
-        } else {
-            Config::default()
+        let yaml_path = Self::config_path();
+        let json_path = Self::legacy_json_path();
+
+        // Try YAML first
+        if yaml_path.exists() {
+            if let Ok(content) = fs::read_to_string(&yaml_path) {
+                if let Ok(config) = serde_yaml::from_str(&content) {
+                    return config;
+                }
+            }
         }
+
+        // Fall back to legacy JSON
+        if json_path.exists() {
+            if let Ok(content) = fs::read_to_string(&json_path) {
+                if let Ok(config) = serde_json::from_str::<Config>(&content) {
+                    // Migrate to YAML
+                    let _ = config.save();
+                    let _ = fs::remove_file(&json_path);
+                    return config;
+                }
+            }
+        }
+
+        Config::default()
     }
 
     fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -158,7 +178,7 @@ impl Config {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let content = serde_json::to_string_pretty(self)?;
+        let content = serde_yaml::to_string(self)?;
         fs::write(&path, content)?;
         Ok(())
     }
@@ -178,6 +198,40 @@ struct OllamaRequest {
 #[derive(Deserialize)]
 struct OllamaResponse {
     response: String,
+}
+
+#[derive(Deserialize)]
+struct OllamaModel {
+    name: String,
+    size: u64,
+}
+
+#[derive(Deserialize)]
+struct OllamaModelsResponse {
+    models: Vec<OllamaModel>,
+}
+
+fn list_ollama_models(config: &Config) -> Result<Vec<OllamaModel>, Box<dyn std::error::Error>> {
+    let url = format!("{}/api/tags", config.ollama_url);
+    let client = reqwest::blocking::Client::new();
+
+    let response = client
+        .get(&url)
+        .send()?
+        .json::<OllamaModelsResponse>()?;
+
+    Ok(response.models)
+}
+
+fn format_size(bytes: u64) -> String {
+    const GB: u64 = 1024 * 1024 * 1024;
+    const MB: u64 = 1024 * 1024;
+
+    if bytes >= GB {
+        format!("{:.1}GB", bytes as f64 / GB as f64)
+    } else {
+        format!("{:.0}MB", bytes as f64 / MB as f64)
+    }
 }
 
 fn generate_ollama(config: &Config, prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
@@ -218,14 +272,15 @@ fn print_usage() {
     eprintln!(
         r#"Usage: ai <intent>
        ai config [show|set <key> <value>]
+       ai models
        ai init [zsh|bash|fish]
 
 Commands:
   config        - Show or modify configuration
+  models        - List available Ollama models
   init          - Install shell integration
 
 Config keys:
-  backend       - 'ollama'
   ollama_model  - Ollama model name (default: llama3.2)
   ollama_url    - Ollama API URL (default: http://localhost:11434)
 
@@ -233,9 +288,39 @@ Examples:
   ai "list all files"
   ai config show
   ai config set ollama_model mistral
+  ai models
   ai init zsh
 "#
     );
+}
+
+fn handle_models() {
+    let config = Config::load();
+
+    match list_ollama_models(&config) {
+        Ok(models) => {
+            if models.is_empty() {
+                println!("No models found. Pull one with: ollama pull llama3.2");
+                return;
+            }
+
+            println!("Available models:\n");
+            for model in &models {
+                let current = if model.name == config.ollama_model || model.name.starts_with(&format!("{}:", config.ollama_model)) {
+                    " (current)"
+                } else {
+                    ""
+                };
+                println!("  {} ({}){}", model.name, format_size(model.size), current);
+            }
+            println!("\nSet model with: ai config set ollama_model <name>");
+        }
+        Err(e) => {
+            eprintln!("Failed to list models: {}", e);
+            eprintln!("Make sure Ollama is running: ollama serve");
+            std::process::exit(1);
+        }
+    }
 }
 
 // ============================================================================
@@ -520,8 +605,20 @@ fn main() {
 
     // Handle subcommands
     match args[0].as_str() {
+        "-h" | "--help" | "help" => {
+            print_usage();
+            return;
+        }
+        "-v" | "--version" | "version" => {
+            println!("ai {}", env!("CARGO_PKG_VERSION"));
+            return;
+        }
         "config" => {
             handle_config(&args[1..]);
+            return;
+        }
+        "models" => {
+            handle_models();
             return;
         }
         "init" => {

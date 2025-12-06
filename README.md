@@ -52,13 +52,21 @@ ai "find large files"
 
 **Shell widget:** Type your intent in the prompt (or leave empty), press `Ctrl+G`, and the buffer is replaced with the AI suggestion.
 
+**List available models:**
+```bash
+ai models
+```
+
 ## Configuration
 
-Config is stored at `~/.config/ai/config.json`.
+Config is stored at `~/.config/ai/config.yaml`.
 
 ```bash
 # Show current config
 ai config show
+
+# List available models
+ai models
 
 # Change Ollama model
 ai config set ollama_model mistral
@@ -72,6 +80,12 @@ ai config set ollama_url http://192.168.1.100:11434
 |-----|---------|-------------|
 | `ollama_model` | `llama3.2` | Ollama model to use |
 | `ollama_url` | `http://localhost:11434` | Ollama API endpoint |
+
+**Example config.yaml:**
+```yaml
+ollama_model: llama3.2
+ollama_url: http://localhost:11434
+```
 
 ## Safety
 
