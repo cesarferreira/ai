@@ -1,9 +1,9 @@
-BINARY := aisuggest
+BINARY := ai
 PREFIX ?= /usr/local/bin
 BUILD_DIR := target/release
 ARTIFACT := $(BUILD_DIR)/$(BINARY)
 
-.PHONY: all build install clean snippet ask test
+.PHONY: all build install setup clean ask test
 
 all: build
 
@@ -13,8 +13,10 @@ build:
 install: build
 	cp "$(ARTIFACT)" "$(PREFIX)/$(BINARY)"
 
-snippet:
-	cat zsh_integration_snippet.txt
+setup: install
+	@$(PREFIX)/$(BINARY) init
+	@echo ""
+	@echo "Run: source ~/.zshrc  (or restart your shell)"
 
 ask: build
 	@intent="$${Q}"; \

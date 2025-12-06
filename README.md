@@ -1,48 +1,70 @@
-AISuggest turns natural-language intent into a single safe shell command using Ollama. It integrates with zsh so pressing Ctrl-G replaces the current line with an AI-generated suggestion; the user still executes it manually.
+# ai
 
-## Install
+Turn natural-language intent into shell commands using Ollama. Press `Ctrl+G` in your terminal, and your intent gets replaced with an AI-generated command.
+
+## Quick Start
 
 ```bash
-# Build
-cargo build --release
+# Build, install, and set up shell integration
+make setup
 
-# Install binary
-sudo cp target/release/aisuggest /usr/local/bin/
-
-# Or use make
-make install
+# Reload your shell
+source ~/.zshrc
 ```
 
-Add the contents of `zsh_integration_snippet.txt` to your `~/.zshrc`, then restart your shell.
+Then type something in your terminal and press `Ctrl+G`!
 
 ## Requirements
 
 - [Ollama](https://ollama.ai) running locally
 - A model pulled (e.g., `ollama pull llama3.2`)
 
+## Install
+
+```bash
+# Build and install binary
+make install
+
+# Set up shell integration (zsh/bash/fish auto-detected)
+ai init
+
+# Or specify shell explicitly
+ai init zsh
+ai init bash
+ai init fish
+
+# Reload your shell config
+source ~/.zshrc
+```
+
+Or do it all at once:
+```bash
+make setup
+```
+
 ## Usage
 
 **CLI:**
 ```bash
-aisuggest "find large files"
+ai "find large files"
 # → prints one command, e.g. du -sh * | sort -h
 ```
 
-**zsh widget:** Type intent in the prompt (or leave empty), press Ctrl-G, the buffer is replaced with the suggestion.
+**Shell widget:** Type your intent in the prompt (or leave empty), press `Ctrl+G`, and the buffer is replaced with the AI suggestion.
 
 ## Configuration
 
-Config is stored at `~/.config/aisuggest/config.json`.
+Config is stored at `~/.config/ai/config.json`.
 
 ```bash
 # Show current config
-aisuggest config show
+ai config show
 
 # Change Ollama model
-aisuggest config set ollama_model mistral
+ai config set ollama_model mistral
 
 # Change Ollama URL (for remote instances)
-aisuggest config set ollama_url http://192.168.1.100:11434
+ai config set ollama_url http://192.168.1.100:11434
 ```
 
 **Config options:**
@@ -54,7 +76,7 @@ aisuggest config set ollama_url http://192.168.1.100:11434
 ## Safety
 
 - Blocks outputs containing `rm -rf /`, `rm -rf *`, backticks, or control characters
-- Unsafe or empty results exit with code 2 (CLI) or keep your buffer unchanged (widget shows "Blocked dangerous command")
+- Unsafe or empty results exit with code 2 (CLI) or keep your buffer unchanged
 - Only a single command is printed; no markdown or extra text
 
 ## How it works
@@ -65,6 +87,7 @@ aisuggest config set ollama_url http://192.168.1.100:11434
 
 ## Troubleshooting
 
-- **"command not found: aisuggest"**: Reinstall to `/usr/local/bin/` and ensure it's on `PATH`
+- **"command not found: ai"**: Run `make install` and ensure `/usr/local/bin` is on your `PATH`
 - **"model error: connection refused"**: Make sure Ollama is running (`ollama serve`)
+- **Ctrl+G not working**: Run `ai init` and reload your shell (`source ~/.zshrc`)
 - **Unsafe suggestion blocked**: Refine your intent; suggestions containing dangerous patterns are discarded

@@ -130,12 +130,15 @@ impl Default for Config {
 }
 
 impl Config {
-    fn config_path() -> PathBuf {
+    fn config_dir() -> PathBuf {
         dirs::home_dir()
             .unwrap_or_default()
             .join(".config")
-            .join("aisuggest")
-            .join("config.json")
+            .join("ai")
+    }
+
+    fn config_path() -> PathBuf {
+        Self::config_dir().join("config.json")
     }
 
     fn load() -> Self {
@@ -213,8 +216,13 @@ fn clean_command(raw: &str) -> String {
 
 fn print_usage() {
     eprintln!(
-        r#"Usage: aisuggest <intent>
-       aisuggest config [show|set <key> <value>]
+        r#"Usage: ai <intent>
+       ai config [show|set <key> <value>]
+       ai init [zsh|bash|fish]
+
+Commands:
+  config        - Show or modify configuration
+  init          - Install shell integration
 
 Config keys:
   backend       - 'ollama'
@@ -222,11 +230,234 @@ Config keys:
   ollama_url    - Ollama API URL (default: http://localhost:11434)
 
 Examples:
-  aisuggest "list all files"
-  aisuggest config show
-  aisuggest config set ollama_model mistral
+  ai "list all files"
+  ai config show
+  ai config set ollama_model mistral
+  ai init zsh
 "#
     );
+}
+
+// ============================================================================
+// Shell Integration
+// ============================================================================
+
+const ZSH_INTEGRATION: &str = r#"# ai shell integration
+_ai_is_safe() {
+  local cmd="${1}"
+  local lowered="${cmd:l}"
+  if [[ "${lowered}" == *"rm -rf /"* || "${lowered}" == *"rm -rf *"* ]]; then
+    return 1
+  fi
+  if [[ "${cmd}" == *\`* ]]; then
+    return 1
+  fi
+  if [[ "${cmd}" == *[$'\000'-$'\037']* ]]; then
+    return 1
+  fi
+  return 0
+}
+
+_ai_widget() {
+  local intent="${BUFFER}"
+  if [[ -z "${intent}" ]]; then
+    intent="suggest a useful command for this directory"
+  fi
+
+  local suggestion status
+  suggestion=$(ai "${intent}" 2>/dev/null)
+  status=$?
+
+  case "${status}" in
+    0) ;;
+    1) zle -M "ai: missing intent"; return ;;
+    2) zle -M "ai: blocked dangerous command"; return ;;
+    *) zle -M "ai: error (${status})"; return ;;
+  esac
+
+  if ! _ai_is_safe "${suggestion}"; then
+    zle -M "ai: blocked dangerous command"
+    return
+  fi
+
+  BUFFER="${suggestion}"
+  CURSOR=${#BUFFER}
+}
+
+zle -N ai-widget _ai_widget
+bindkey '^G' ai-widget
+"#;
+
+const BASH_INTEGRATION: &str = r#"# ai shell integration
+_ai_is_safe() {
+  local cmd="$1"
+  local lowered="${cmd,,}"
+  if [[ "$lowered" == *"rm -rf /"* || "$lowered" == *"rm -rf *"* ]]; then
+    return 1
+  fi
+  if [[ "$cmd" == *\`* ]]; then
+    return 1
+  fi
+  return 0
+}
+
+_ai_suggest() {
+  local intent="$READLINE_LINE"
+  if [[ -z "$intent" ]]; then
+    intent="suggest a useful command for this directory"
+  fi
+
+  local suggestion status
+  suggestion=$(ai "$intent" 2>/dev/null)
+  status=$?
+
+  if [[ $status -ne 0 ]]; then
+    return
+  fi
+
+  if ! _ai_is_safe "$suggestion"; then
+    return
+  fi
+
+  READLINE_LINE="$suggestion"
+  READLINE_POINT=${#READLINE_LINE}
+}
+
+bind -x '"\C-g": _ai_suggest'
+"#;
+
+const FISH_INTEGRATION: &str = r#"# ai shell integration
+function _ai_is_safe
+  set -l cmd $argv[1]
+  set -l lowered (string lower $cmd)
+  if string match -q "*rm -rf /*" $lowered; or string match -q "*rm -rf \\**" $lowered
+    return 1
+  end
+  if string match -q "*\`*" $cmd
+    return 1
+  end
+  return 0
+end
+
+function _ai_suggest
+  set -l intent (commandline)
+  if test -z "$intent"
+    set intent "suggest a useful command for this directory"
+  end
+
+  set -l suggestion (ai "$intent" 2>/dev/null)
+  set -l status_code $status
+
+  if test $status_code -ne 0
+    return
+  end
+
+  if not _ai_is_safe "$suggestion"
+    return
+  end
+
+  commandline -r "$suggestion"
+  commandline -f end-of-line
+end
+
+bind \cg _ai_suggest
+"#;
+
+fn get_shell_rc_path(shell: &str) -> Option<PathBuf> {
+    let home = dirs::home_dir()?;
+    match shell {
+        "zsh" => Some(home.join(".zshrc")),
+        "bash" => {
+            let bashrc = home.join(".bashrc");
+            let bash_profile = home.join(".bash_profile");
+            if bashrc.exists() {
+                Some(bashrc)
+            } else {
+                Some(bash_profile)
+            }
+        }
+        "fish" => Some(home.join(".config/fish/config.fish")),
+        _ => None,
+    }
+}
+
+fn get_integration_content(shell: &str) -> Option<&'static str> {
+    match shell {
+        "zsh" => Some(ZSH_INTEGRATION),
+        "bash" => Some(BASH_INTEGRATION),
+        "fish" => Some(FISH_INTEGRATION),
+        _ => None,
+    }
+}
+
+fn handle_init(args: &[String]) {
+    let shell = if args.is_empty() {
+        // Try to detect shell from SHELL env var
+        env::var("SHELL")
+            .ok()
+            .and_then(|s| s.rsplit('/').next().map(String::from))
+            .unwrap_or_else(|| "zsh".to_string())
+    } else {
+        args[0].clone()
+    };
+
+    let integration = match get_integration_content(&shell) {
+        Some(content) => content,
+        None => {
+            eprintln!("Unsupported shell: {}. Supported: zsh, bash, fish", shell);
+            std::process::exit(1);
+        }
+    };
+
+    let rc_path = match get_shell_rc_path(&shell) {
+        Some(path) => path,
+        None => {
+            eprintln!("Could not determine shell config path");
+            std::process::exit(1);
+        }
+    };
+
+    // Write integration file to config dir
+    let integration_path = Config::config_dir().join(format!("integration.{}", shell));
+    if let Err(e) = fs::create_dir_all(Config::config_dir()) {
+        eprintln!("Failed to create config directory: {}", e);
+        std::process::exit(1);
+    }
+    if let Err(e) = fs::write(&integration_path, integration) {
+        eprintln!("Failed to write integration file: {}", e);
+        std::process::exit(1);
+    }
+
+    // Check if already sourced in rc file
+    let source_line = format!("source \"{}\"", integration_path.display());
+    let rc_content = fs::read_to_string(&rc_path).unwrap_or_default();
+
+    if rc_content.contains(&source_line) || rc_content.contains(integration_path.to_str().unwrap_or("")) {
+        println!("Shell integration already installed in {}", rc_path.display());
+        println!("\nRun this to reload your shell:");
+        println!("  source \"{}\"", rc_path.display());
+        return;
+    }
+
+    // Append source line to rc file
+    let addition = format!("\n# ai\n{}\n", source_line);
+    if let Err(e) = fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(&rc_path)
+        .and_then(|mut f| std::io::Write::write_all(&mut f, addition.as_bytes()))
+    {
+        eprintln!("Failed to update {}: {}", rc_path.display(), e);
+        eprintln!("\nManually add this line to your shell config:");
+        eprintln!("  {}", source_line);
+        std::process::exit(1);
+    }
+
+    println!("Installed {} integration to {}", shell, rc_path.display());
+    println!("Integration file: {}", integration_path.display());
+    println!("\nRun this to activate now:");
+    println!("  source \"{}\"", rc_path.display());
+    println!("\nThen press Ctrl+G to trigger AI suggestions!");
 }
 
 fn handle_config(args: &[String]) {
@@ -243,7 +474,7 @@ fn handle_config(args: &[String]) {
 
     if args[0] == "set" {
         if args.len() < 3 {
-            eprintln!("Usage: aisuggest config set <key> <value>");
+            eprintln!("Usage: ai config set <key> <value>");
             std::process::exit(1);
         }
 
@@ -287,10 +518,17 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Handle config subcommand
-    if args[0] == "config" {
-        handle_config(&args[1..]);
-        return;
+    // Handle subcommands
+    match args[0].as_str() {
+        "config" => {
+            handle_config(&args[1..]);
+            return;
+        }
+        "init" => {
+            handle_init(&args[1..]);
+            return;
+        }
+        _ => {}
     }
 
     let intent = args.join(" ").trim().to_string();
