@@ -1,0 +1,61 @@
+# Xcode
+build/
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/project.xcworkspace/xcuserdata/
+
+# Xcode - state files
+*.xcuserstate
+*.xcscmblueprint
+*.xccheckout
+
+# Build artifacts
+*.ipa
+*.dSYM.zip
+*.dSYM
+*.xcarchive
+
+# Distribution
+*.zip
+*.dmg
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Finder
+.Spotlight-V100
+.Trashes
+
+# Swift Package Manager
+.build/
+Packages/
+Package.resolved
+*.xcframework
+
+# CocoaPods (if used)
+Pods/
+
+# Carthage (if used)
+Carthage/Build/
+
+# Fastlane
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots/**/*.png
+
+# Code coverage
+*.gcno
+*.gcda
+*.gcov
+
+# Playgrounds
+timeline.xctimeline
+playground.xcworkspace
+
+# IDE
+*.swp
+*~
