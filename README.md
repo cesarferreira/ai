@@ -22,16 +22,14 @@ Then type something in your terminal and press `Ctrl+G`!
 ## Install
 
 ```bash
-# Build and install binary
+# Install binary to ~/.cargo/bin
+cargo install --path .
+
+# Or use make
 make install
 
 # Set up shell integration (zsh/bash/fish auto-detected)
 ai init
-
-# Or specify shell explicitly
-ai init zsh
-ai init bash
-ai init fish
 
 # Reload your shell config
 source ~/.zshrc
@@ -40,6 +38,7 @@ source ~/.zshrc
 Or do it all at once:
 ```bash
 make setup
+source ~/.zshrc
 ```
 
 ## Usage

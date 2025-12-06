@@ -349,15 +349,15 @@ _ai_widget() {
     intent="suggest a useful command for this directory"
   fi
 
-  local suggestion status
+  local suggestion exit_code
   suggestion=$(ai "${intent}" 2>/dev/null)
-  status=$?
+  exit_code=$?
 
-  case "${status}" in
+  case "${exit_code}" in
     0) ;;
     1) zle -M "ai: missing intent"; return ;;
     2) zle -M "ai: blocked dangerous command"; return ;;
-    *) zle -M "ai: error (${status})"; return ;;
+    *) zle -M "ai: error (${exit_code})"; return ;;
   esac
 
   if ! _ai_is_safe "${suggestion}"; then
