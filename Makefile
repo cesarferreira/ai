@@ -3,7 +3,7 @@ PREFIX ?= /usr/local/bin
 BUILD_DIR := .build/release
 ARTIFACT := $(BUILD_DIR)/$(BINARY)
 
-.PHONY: all build install clean snippet ask
+.PHONY: all build install clean snippet ask test
 
 all: build
 
@@ -29,3 +29,13 @@ ask: build
 
 clean:
 	swift package clean
+
+test: build
+	@echo "==> Switching to ollama backend..."
+	@$(ARTIFACT) config set backend ollama
+	@echo ""
+	@echo "==> Asking: 'how many lines in README.md'"
+	@echo "Command: $$($(ARTIFACT) "how many lines in README.md")"
+	@echo ""
+	@echo "==> Actual answer:"
+	@wc -l README.md
