@@ -1,0 +1,44 @@
+_ai_suggest_is_safe() {
+  local cmd="${1}"
+  local lowered="${cmd:l}"
+  if [[ "${lowered}" == *"rm -rf /"* || "${lowered}" == *"rm -rf *"* ]]; then
+    return 1
+  fi
+  if [[ "${cmd}" == *\`* ]]; then
+    return 1
+  fi
+  if [[ "${cmd}" == *[$'\000'-$'\037']* ]]; then
+    return 1
+  fi
+  return 0
+}
+
+_ai_suggest_widget() {
+  local intent="${BUFFER}"
+  if [[ -z "${intent}" ]]; then
+    intent="suggest a useful command for this directory"
+  fi
+
+  local suggestion status
+  suggestion=$(aisuggest "${intent}" 2>/dev/null)
+  status=$?
+
+  case "${status}" in
+    0) ;;
+    1) zle -M "AISuggest: missing intent"; return ;;
+    2) zle -M "Blocked dangerous command"; return ;;
+    *) zle -M "AISuggest error (${status})"; return ;;
+  esac
+
+  if ! _ai_suggest_is_safe "${suggestion}"; then
+    zle -M "Blocked dangerous command"
+    return
+  fi
+
+  BUFFER="${suggestion}"
+  CURSOR=${#BUFFER}
+  zle -M "AISuggest updated command"
+}
+
+zle -N ai-suggest-widget _ai_suggest_widget
+bindkey '^G' ai-suggest-widget
