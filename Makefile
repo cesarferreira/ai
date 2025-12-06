@@ -1,6 +1,6 @@
 BINARY := aisuggest
 PREFIX ?= /usr/local/bin
-BUILD_DIR := .build/release
+BUILD_DIR := target/release
 ARTIFACT := $(BUILD_DIR)/$(BINARY)
 
 .PHONY: all build install clean snippet ask test
@@ -8,7 +8,7 @@ ARTIFACT := $(BUILD_DIR)/$(BINARY)
 all: build
 
 build:
-	swift build -c release
+	cargo build --release
 
 install: build
 	cp "$(ARTIFACT)" "$(PREFIX)/$(BINARY)"
@@ -28,12 +28,9 @@ ask: build
 	$(ARTIFACT) "$${intent}"
 
 clean:
-	swift package clean
+	cargo clean
 
 test: build
-	@echo "==> Switching to ollama backend..."
-	@$(ARTIFACT) config set backend ollama
-	@echo ""
 	@echo "==> Asking: 'how many lines in README.md'"
 	@echo "Command: $$($(ARTIFACT) "how many lines in README.md")"
 	@echo ""
