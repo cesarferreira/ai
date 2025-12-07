@@ -1,6 +1,13 @@
+use crossterm::{
+    cursor,
+    style::{Color, Print, SetForegroundColor, ResetColor},
+    terminal::{self, ClearType},
+    ExecutableCommand,
+};
 use serde::{Deserialize, Serialize};
 use std::env;
 use std::fs;
+use std::io::{self, BufRead, BufReader, Write};
 use std::path::PathBuf;
 
 // ============================================================================
@@ -198,6 +205,8 @@ struct OllamaRequest {
 #[derive(Deserialize)]
 struct OllamaResponse {
     response: String,
+    #[serde(default)]
+    done: bool,
 }
 
 #[derive(Deserialize)]
@@ -234,23 +243,125 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-fn generate_ollama(config: &Config, prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn generate_ollama_streaming<F>(
+    config: &Config,
+    prompt: &str,
+    mut on_token: F,
+) -> Result<String, Box<dyn std::error::Error>>
+where
+    F: FnMut(&str),
+{
     let url = format!("{}/api/generate", config.ollama_url);
     let client = reqwest::blocking::Client::new();
 
     let request = OllamaRequest {
         model: config.ollama_model.clone(),
         prompt: prompt.to_string(),
-        stream: false,
+        stream: true,
     };
 
-    let response = client
-        .post(&url)
-        .json(&request)
-        .send()?
-        .json::<OllamaResponse>()?;
+    let response = client.post(&url).json(&request).send()?;
+    let reader = BufReader::new(response);
 
-    Ok(response.response)
+    let mut full_response = String::new();
+
+    for line in reader.lines() {
+        let line = line?;
+        if line.is_empty() {
+            continue;
+        }
+
+        if let Ok(chunk) = serde_json::from_str::<OllamaResponse>(&line) {
+            full_response.push_str(&chunk.response);
+            on_token(&chunk.response);
+
+            if chunk.done {
+                break;
+            }
+        }
+    }
+
+    Ok(full_response)
+}
+
+fn generate_ollama_quiet(config: &Config, prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    generate_ollama_streaming(config, prompt, |_| {})
+}
+
+// ============================================================================
+// TUI
+// ============================================================================
+
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+fn run_interactive(intent: &str, config: &Config, prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+    let mut stdout = io::stdout();
+    let is_tty = atty::is(atty::Stream::Stdout);
+
+    if !is_tty {
+        // Non-interactive mode, just generate quietly
+        return generate_ollama_quiet(config, prompt);
+    }
+
+    // Show intent
+    stdout.execute(SetForegroundColor(Color::DarkGrey))?;
+    stdout.execute(Print(format!("› {}\n", intent)))?;
+    stdout.execute(ResetColor)?;
+
+    // Show spinner while waiting for first token
+    let spinner_idx = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let spinner_idx_clone = spinner_idx.clone();
+    let got_first_token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let got_first_token_clone = got_first_token.clone();
+
+    // Start spinner in background
+    let spinner_handle = std::thread::spawn(move || {
+        let mut stdout = io::stdout();
+        while !got_first_token_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            let idx = spinner_idx_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % SPINNER_FRAMES.len();
+            let _ = stdout.execute(cursor::MoveToColumn(0));
+            let _ = stdout.execute(SetForegroundColor(Color::Cyan));
+            let _ = stdout.execute(Print(format!("{} thinking...", SPINNER_FRAMES[idx])));
+            let _ = stdout.execute(ResetColor);
+            let _ = stdout.flush();
+            std::thread::sleep(std::time::Duration::from_millis(80));
+        }
+    });
+
+    let mut result = String::new();
+    let mut first_token = true;
+
+    let generation_result = generate_ollama_streaming(config, prompt, |token| {
+        if first_token {
+            got_first_token.store(true, std::sync::atomic::Ordering::Relaxed);
+            // Clear spinner line
+            let _ = stdout.execute(cursor::MoveToColumn(0));
+            let _ = stdout.execute(terminal::Clear(ClearType::CurrentLine));
+            let _ = stdout.execute(SetForegroundColor(Color::Green));
+            let _ = stdout.execute(Print("› "));
+            let _ = stdout.execute(ResetColor);
+            first_token = false;
+        }
+        let _ = stdout.execute(Print(token));
+        let _ = stdout.flush();
+        result.push_str(token);
+    });
+
+    // Wait for spinner to stop
+    got_first_token.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = spinner_handle.join();
+
+    // If we never got a token, clear spinner
+    if first_token {
+        stdout.execute(cursor::MoveToColumn(0))?;
+        stdout.execute(terminal::Clear(ClearType::CurrentLine))?;
+    }
+
+    println!(); // newline after response
+
+    generation_result?;
+
+    Ok(result)
 }
 
 // ============================================================================
@@ -262,6 +373,62 @@ fn clean_command(raw: &str) -> String {
         .replace('\r', " ")
         .trim()
         .to_string()
+}
+
+// ============================================================================
+// Clipboard (for copying command)
+// ============================================================================
+
+#[cfg(target_os = "macos")]
+fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    use std::process::{Command, Stdio};
+
+    let mut child = Command::new("pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()?;
+
+    if let Some(stdin) = child.stdin.as_mut() {
+        stdin.write_all(text.as_bytes())?;
+    }
+
+    child.wait()?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn copy_to_clipboard(text: &str) -> io::Result<()> {
+    use std::process::{Command, Stdio};
+
+    // Try xclip first, then xsel
+    let result = Command::new("xclip")
+        .args(["-selection", "clipboard"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .or_else(|_| {
+            Command::new("xsel")
+                .args(["--clipboard", "--input"])
+                .stdin(Stdio::piped())
+                .spawn()
+        });
+
+    match result {
+        Ok(mut child) => {
+            if let Some(stdin) = child.stdin.as_mut() {
+                stdin.write_all(text.as_bytes())?;
+            }
+            child.wait()?;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn copy_to_clipboard(_text: &str) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "Clipboard not supported on this platform",
+    ))
 }
 
 // ============================================================================
@@ -349,8 +516,12 @@ _ai_widget() {
     intent="suggest a useful command for this directory"
   fi
 
+  # Clear current line and run ai with TUI on /dev/tty, capture result
+  zle -I  # invalidate display
+  echo ""  # newline before ai output
+
   local suggestion exit_code
-  suggestion=$(ai "${intent}" 2>/dev/null)
+  suggestion=$(ai --quick "${intent}" 2>/dev/null </dev/tty)
   exit_code=$?
 
   case "${exit_code}" in
@@ -367,6 +538,7 @@ _ai_widget() {
 
   BUFFER="${suggestion}"
   CURSOR=${#BUFFER}
+  zle redisplay
 }
 
 zle -N ai-widget _ai_widget
@@ -392,11 +564,11 @@ _ai_suggest() {
     intent="suggest a useful command for this directory"
   fi
 
-  local suggestion status
+  local suggestion exit_code
   suggestion=$(ai "$intent" 2>/dev/null)
-  status=$?
+  exit_code=$?
 
-  if [[ $status -ne 0 ]]; then
+  if [[ $exit_code -ne 0 ]]; then
     return
   fi
 
@@ -431,9 +603,9 @@ function _ai_suggest
   end
 
   set -l suggestion (ai "$intent" 2>/dev/null)
-  set -l status_code $status
+  set -l exit_code $status
 
-  if test $status_code -ne 0
+  if test $exit_code -ne 0
     return
   end
 
@@ -603,6 +775,15 @@ fn main() {
         std::process::exit(1);
     }
 
+    // Check for --quick flag (quiet mode for shell integration)
+    let quick_mode = args.iter().any(|a| a == "--quick" || a == "-q");
+    let args: Vec<String> = args.into_iter().filter(|a| a != "--quick" && a != "-q").collect();
+
+    if args.is_empty() {
+        print_usage();
+        std::process::exit(1);
+    }
+
     // Handle subcommands
     match args[0].as_str() {
         "-h" | "--help" | "help" => {
@@ -636,14 +817,25 @@ fn main() {
     let prompt = build_prompt(&intent, &working_directory, &files);
 
     let config = Config::load();
-    let raw = match config.backend {
-        Backend::Ollama => match generate_ollama(&config, &prompt) {
+
+    let raw = if quick_mode {
+        // Quick mode: no TUI, just output the command
+        match generate_ollama_quiet(&config, &prompt) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("model error: {}", e);
                 std::process::exit(3);
             }
-        },
+        }
+    } else {
+        // Interactive mode with TUI
+        match run_interactive(&intent, &config, &prompt) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("model error: {}", e);
+                std::process::exit(3);
+            }
+        }
     };
 
     let command = clean_command(&raw);
@@ -651,5 +843,16 @@ fn main() {
         std::process::exit(2);
     }
 
-    println!("{}", command);
+    // In quick mode or non-TTY, print the command to stdout
+    if quick_mode || !atty::is(atty::Stream::Stdout) {
+        println!("{}", command);
+    } else {
+        // Interactive mode: copy to clipboard
+        if copy_to_clipboard(&command).is_ok() {
+            let mut stdout = io::stdout();
+            let _ = stdout.execute(SetForegroundColor(Color::DarkGrey));
+            let _ = stdout.execute(Print("Copied to clipboard. Press Cmd+V to paste.\n"));
+            let _ = stdout.execute(ResetColor);
+        }
+    }
 }
