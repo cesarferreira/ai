@@ -22,10 +22,8 @@ fn is_safe(command: &str) -> bool {
     if lowered.contains("rm -rf *") {
         return false;
     }
-    if command.contains('`') {
-        return false;
-    }
-    if command.chars().any(|c| (c as u32) < 0x20 && c != '\t') {
+    // Block control characters (except tab and newline)
+    if command.chars().any(|c| (c as u32) < 0x20 && c != '\t' && c != '\n') {
         return false;
     }
     true
@@ -38,7 +36,7 @@ fn is_safe(command: &str) -> bool {
 fn build_prompt(intent: &str, working_directory: &str, files: &[String]) -> String {
     let file_list = files.join("\n");
     format!(
-        r#"You are a CLI assistant. Convert the user's intent into a single safe shell command.
+        r#"You are a CLI assistant. Convert the user's intent into a single shell command.
 
 Current directory: {}
 Files:
@@ -46,12 +44,12 @@ Files:
 
 User intent: "{}"
 
-Rules:
-- Respond with ONE shell command only.
-- No markdown.
-- No explanation.
-- No prose.
-- Favor safe operations."#,
+STRICT RULES:
+- Output ONLY the command itself, nothing else
+- NO markdown, NO backticks, NO code blocks
+- NO explanations, NO comments, NO alternatives
+- ONE single line command only
+- Do NOT wrap in quotes or backticks"#,
         working_directory, file_list, intent
     )
 }
@@ -369,10 +367,30 @@ fn run_interactive(intent: &str, config: &Config, prompt: &str) -> Result<String
 // ============================================================================
 
 fn clean_command(raw: &str) -> String {
-    raw.replace('\n', " ")
-        .replace('\r', " ")
-        .trim()
-        .to_string()
+    let mut cmd = raw.to_string();
+
+    // Remove markdown code blocks
+    if cmd.contains("```") {
+        // Extract content between ``` markers
+        if let Some(start) = cmd.find("```") {
+            let after_start = &cmd[start + 3..];
+            // Skip language identifier (e.g., ```bash)
+            let content_start = after_start.find('\n').map(|i| i + 1).unwrap_or(0);
+            let content = &after_start[content_start..];
+            if let Some(end) = content.find("```") {
+                cmd = content[..end].to_string();
+            }
+        }
+    }
+
+    // Remove inline backticks
+    cmd = cmd.replace('`', "");
+
+    // Take only the first line (ignore any explanations)
+    cmd = cmd.lines().next().unwrap_or("").to_string();
+
+    // Clean up whitespace
+    cmd.replace('\r', "").trim().to_string()
 }
 
 // ============================================================================
