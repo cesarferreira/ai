@@ -114,6 +114,10 @@ struct Config {
     ollama_model: String,
     #[serde(default = "default_ollama_url")]
     ollama_url: String,
+    #[serde(default = "default_router_model")]
+    router_model: String,
+    #[serde(default = "default_router_enabled")]
+    router_enabled: bool,
 }
 
 fn default_ollama_model() -> String {
@@ -124,12 +128,22 @@ fn default_ollama_url() -> String {
     "http://localhost:11434".to_string()
 }
 
+fn default_router_model() -> String {
+    "qwen2.5:0.5b".to_string()
+}
+
+fn default_router_enabled() -> bool {
+    true
+}
+
 impl Default for Config {
     fn default() -> Self {
         Config {
             backend: Backend::default(),
             ollama_model: default_ollama_model(),
             ollama_url: default_ollama_url(),
+            router_model: default_router_model(),
+            router_enabled: default_router_enabled(),
         }
     }
 }
@@ -290,45 +304,448 @@ fn generate_ollama_quiet(config: &Config, prompt: &str) -> Result<String, Box<dy
     generate_ollama_streaming(config, prompt, |_| {})
 }
 
+fn generate_with_model(
+    config: &Config,
+    model: &str,
+    prompt: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let url = format!("{}/api/generate", config.ollama_url);
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(60)) // 1 minute for router
+        .build()?;
+
+    let request = OllamaRequest {
+        model: model.to_string(),
+        prompt: prompt.to_string(),
+        stream: false,
+    };
+
+    let response = client.post(&url).json(&request).send()?;
+    let result: OllamaResponse = response.json()?;
+    Ok(result.response)
+}
+
+// ============================================================================
+// Context Gatherers
+// ============================================================================
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ContextNeeds {
+    #[serde(default)]
+    git_diff: bool,
+    #[serde(default)]
+    git_diff_staged: bool,
+    #[serde(default)]
+    git_status: bool,
+    #[serde(default)]
+    git_log: bool,
+    #[serde(default)]
+    git_branch: bool,
+    #[serde(default)]
+    file_tree: bool,
+    #[serde(default)]
+    read_files: Vec<String>,
+}
+
+impl Default for ContextNeeds {
+    fn default() -> Self {
+        ContextNeeds {
+            git_diff: false,
+            git_diff_staged: false,
+            git_status: false,
+            git_log: false,
+            git_branch: false,
+            file_tree: false,
+            read_files: vec![],
+        }
+    }
+}
+
+fn run_command(cmd: &str, args: &[&str]) -> Option<String> {
+    use std::process::Command;
+    Command::new(cmd)
+        .args(args)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn is_git_repo() -> bool {
+    run_command("git", &["rev-parse", "--git-dir"]).is_some()
+}
+
+fn gather_context(needs: &ContextNeeds) -> String {
+    let mut context_parts: Vec<String> = vec![];
+
+    if !is_git_repo() {
+        // Skip git-related context if not in a git repo
+        if needs.file_tree {
+            if let Some(tree) = run_command("ls", &["-la"]) {
+                context_parts.push(format!("=== File listing ===\n{}", tree));
+            }
+        }
+        if !needs.read_files.is_empty() {
+            for file in &needs.read_files {
+                if let Ok(content) = fs::read_to_string(file) {
+                    let truncated: String = content.chars().take(2000).collect();
+                    context_parts.push(format!("=== {} ===\n{}", file, truncated));
+                }
+            }
+        }
+        return context_parts.join("\n\n");
+    }
+
+    if needs.git_status {
+        if let Some(status) = run_command("git", &["status", "--short"]) {
+            context_parts.push(format!("=== Git Status ===\n{}", status));
+        }
+    }
+
+    if needs.git_diff {
+        if let Some(diff) = run_command("git", &["diff"]) {
+            // Truncate long diffs
+            let truncated: String = diff.chars().take(4000).collect();
+            context_parts.push(format!("=== Git Diff (unstaged) ===\n{}", truncated));
+        }
+    }
+
+    if needs.git_diff_staged {
+        if let Some(diff) = run_command("git", &["diff", "--staged"]) {
+            let truncated: String = diff.chars().take(4000).collect();
+            context_parts.push(format!("=== Git Diff (staged) ===\n{}", truncated));
+        }
+    }
+
+    if needs.git_log {
+        if let Some(log) = run_command("git", &["log", "--oneline", "-10"]) {
+            context_parts.push(format!("=== Recent Commits ===\n{}", log));
+        }
+    }
+
+    if needs.git_branch {
+        if let Some(branch) = run_command("git", &["branch", "-a"]) {
+            context_parts.push(format!("=== Branches ===\n{}", branch));
+        }
+    }
+
+    if needs.file_tree {
+        // Try tree command first, fall back to find
+        let tree = run_command("tree", &["-L", "2", "--noreport"])
+            .or_else(|| run_command("find", &[".", "-maxdepth", "2", "-type", "f"]));
+        if let Some(t) = tree {
+            let truncated: String = t.chars().take(2000).collect();
+            context_parts.push(format!("=== File Tree ===\n{}", truncated));
+        }
+    }
+
+    if !needs.read_files.is_empty() {
+        for file in &needs.read_files {
+            if let Ok(content) = fs::read_to_string(file) {
+                let truncated: String = content.chars().take(2000).collect();
+                context_parts.push(format!("=== {} ===\n{}", file, truncated));
+            }
+        }
+    }
+
+    context_parts.join("\n\n")
+}
+
+// ============================================================================
+// Router
+// ============================================================================
+
+const ROUTER_PROMPT: &str = r#"You are a context analyzer. Given a user's intent for a shell command, determine what additional context would help generate a better command.
+
+Available context types:
+- git_diff: unstaged changes (for commits, reviews, understanding changes)
+- git_diff_staged: staged changes (for commit messages)
+- git_status: current repo status (for commits, status checks)
+- git_log: recent commit history (for commit message style, rebasing)
+- git_branch: list of branches (for branch operations)
+- file_tree: directory structure (for navigation, finding files)
+- read_files: specific files to read (list filenames from the current directory)
+
+User intent: "{}"
+Current directory: {}
+Files in directory: {}
+
+Respond with ONLY a JSON object (no markdown, no explanation). Example:
+{"git_diff": false, "git_diff_staged": true, "git_status": true, "git_log": true, "git_branch": false, "file_tree": false, "read_files": []}
+
+If no extra context is needed, respond with:
+{"git_diff": false, "git_diff_staged": false, "git_status": false, "git_log": false, "git_branch": false, "file_tree": false, "read_files": []}
+"#;
+
+fn parse_router_response(response: &str) -> ContextNeeds {
+    // Try to extract JSON from response
+    let cleaned = response.trim();
+
+    // Try direct parse first
+    if let Ok(needs) = serde_json::from_str::<ContextNeeds>(cleaned) {
+        return needs;
+    }
+
+    // Try to find JSON object in response
+    if let Some(start) = cleaned.find('{') {
+        if let Some(end) = cleaned.rfind('}') {
+            let json_str = &cleaned[start..=end];
+            if let Ok(needs) = serde_json::from_str::<ContextNeeds>(json_str) {
+                return needs;
+            }
+        }
+    }
+
+    // Default: no extra context needed
+    ContextNeeds::default()
+}
+
+fn route_intent(
+    config: &Config,
+    intent: &str,
+    working_directory: &str,
+    files: &[String],
+) -> ContextNeeds {
+    let file_list = files.join(", ");
+    let prompt = ROUTER_PROMPT
+        .replace("{}", intent)
+        .replacen("{}", working_directory, 1)
+        .replacen("{}", &file_list, 1);
+
+    match generate_with_model(config, &config.router_model, &prompt) {
+        Ok(response) => parse_router_response(&response),
+        Err(_) => ContextNeeds::default(),
+    }
+}
+
+fn build_prompt_with_context(
+    intent: &str,
+    working_directory: &str,
+    files: &[String],
+    extra_context: &str,
+) -> String {
+    let file_list = files.join("\n");
+
+    if extra_context.is_empty() {
+        return build_prompt(intent, working_directory, files);
+    }
+
+    format!(
+        r#"You are a CLI assistant. Convert the user's intent into a single shell command.
+
+Current directory: {}
+Files:
+{}
+
+Additional context:
+{}
+
+User intent: "{}"
+
+STRICT RULES:
+- Output ONLY the command itself, nothing else
+- NO markdown, NO backticks, NO code blocks
+- NO explanations, NO comments, NO alternatives
+- ONE single line command only
+- Do NOT wrap in quotes or backticks"#,
+        working_directory, file_list, extra_context, intent
+    )
+}
+
 // ============================================================================
 // TUI
 // ============================================================================
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-fn run_interactive(
+fn show_spinner_phase(stdout: &mut io::Stdout, phase: &str, elapsed: f32, spinner_idx: usize) {
+    let _ = stdout.execute(cursor::MoveToColumn(0));
+    let _ = stdout.execute(terminal::Clear(ClearType::CurrentLine));
+    let _ = stdout.execute(SetForegroundColor(Color::Cyan));
+    let _ = stdout.execute(Print(format!(
+        "{} {}... {:.1}s",
+        SPINNER_FRAMES[spinner_idx % SPINNER_FRAMES.len()],
+        phase,
+        elapsed
+    )));
+    let _ = stdout.execute(ResetColor);
+    let _ = stdout.flush();
+}
+
+fn run_interactive_with_routing(
     intent: &str,
     config: &Config,
-    prompt: &str,
-    file_count: usize,
+    working_directory: &str,
+    files: &[String],
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut stdout = io::stdout();
     let is_tty = atty::is(atty::Stream::Stdout);
+    let file_count = files.len();
 
     if !is_tty {
-        // Non-interactive mode, just generate quietly
-        return generate_ollama_quiet(config, prompt);
+        // Non-interactive mode, skip routing for speed
+        let prompt = build_prompt(intent, working_directory, files);
+        return generate_ollama_quiet(config, &prompt);
     }
-
-    // Show context header
-    stdout.execute(SetForegroundColor(Color::DarkGrey))?;
-    stdout.execute(Print(format!(
-        "Using {} · {} files in context\n",
-        config.ollama_model, file_count
-    )))?;
-    stdout.execute(ResetColor)?;
 
     // Show intent
     stdout.execute(SetForegroundColor(Color::White))?;
     stdout.execute(Print(format!("› {}\n", intent)))?;
     stdout.execute(ResetColor)?;
 
-    // Spinner state
+    let start_time = std::time::Instant::now();
+    let mut extra_context = String::new();
+    let mut context_gathered: Vec<String> = vec![];
+
+    // Phase 1: Router (if enabled)
+    if config.router_enabled {
+        stdout.execute(SetForegroundColor(Color::DarkGrey))?;
+        stdout.execute(Print(format!("Router: {} · ", config.router_model)))?;
+        stdout.execute(ResetColor)?;
+
+        let mut spinner_idx = 0;
+        let router_start = std::time::Instant::now();
+
+        // Show analyzing spinner
+        let needs = {
+            let file_list = files.join(", ");
+            let prompt = ROUTER_PROMPT
+                .replace("{}", intent)
+                .replacen("{}", working_directory, 1)
+                .replacen("{}", &file_list, 1);
+
+            let router_model = config.router_model.clone();
+            let ollama_url = config.ollama_url.clone();
+
+            let handle = std::thread::spawn(move || {
+                let url = format!("{}/api/generate", ollama_url);
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(60))
+                    .build()
+                    .ok()?;
+
+                let request = OllamaRequest {
+                    model: router_model,
+                    prompt,
+                    stream: false,
+                };
+
+                let response = client.post(&url).json(&request).send().ok()?;
+                let result: OllamaResponse = response.json().ok()?;
+                Some(result.response)
+            });
+
+            // Show spinner while waiting
+            loop {
+                if handle.is_finished() {
+                    break;
+                }
+
+                let elapsed = router_start.elapsed().as_secs_f32();
+                let _ = stdout.execute(cursor::MoveToColumn(0));
+                let _ = stdout.execute(terminal::Clear(ClearType::CurrentLine));
+                let _ = stdout.execute(SetForegroundColor(Color::DarkGrey));
+                let _ = stdout.execute(Print(format!(
+                    "Router: {} {} Analyzing... {:.1}s",
+                    config.router_model,
+                    SPINNER_FRAMES[spinner_idx % SPINNER_FRAMES.len()],
+                    elapsed
+                )));
+                let _ = stdout.execute(ResetColor);
+                let _ = stdout.flush();
+
+                spinner_idx += 1;
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+
+            match handle.join() {
+                Ok(Some(response)) => parse_router_response(&response),
+                _ => ContextNeeds::default(),
+            }
+        };
+
+        // Clear router line
+        stdout.execute(cursor::MoveToColumn(0))?;
+        stdout.execute(terminal::Clear(ClearType::CurrentLine))?;
+
+        // Check what context was requested
+        let needs_any = needs.git_diff
+            || needs.git_diff_staged
+            || needs.git_status
+            || needs.git_log
+            || needs.git_branch
+            || needs.file_tree
+            || !needs.read_files.is_empty();
+
+        if needs_any {
+            // Show what context is being gathered
+            let mut gathering: Vec<&str> = vec![];
+            if needs.git_status {
+                gathering.push("status");
+            }
+            if needs.git_diff {
+                gathering.push("diff");
+            }
+            if needs.git_diff_staged {
+                gathering.push("staged");
+            }
+            if needs.git_log {
+                gathering.push("log");
+            }
+            if needs.git_branch {
+                gathering.push("branches");
+            }
+            if needs.file_tree {
+                gathering.push("tree");
+            }
+            if !needs.read_files.is_empty() {
+                gathering.push("files");
+            }
+
+            stdout.execute(SetForegroundColor(Color::DarkGrey))?;
+            stdout.execute(Print(format!(
+                "Gathering context: {}\n",
+                gathering.join(", ")
+            )))?;
+            stdout.execute(ResetColor)?;
+
+            context_gathered = gathering.iter().map(|s| s.to_string()).collect();
+            extra_context = gather_context(&needs);
+        } else {
+            stdout.execute(SetForegroundColor(Color::DarkGrey))?;
+            stdout.execute(Print("No extra context needed\n"))?;
+            stdout.execute(ResetColor)?;
+        }
+    }
+
+    // Build final prompt
+    let prompt = if extra_context.is_empty() {
+        build_prompt(intent, working_directory, files)
+    } else {
+        build_prompt_with_context(intent, working_directory, files, &extra_context)
+    };
+
+    // Show model info
+    stdout.execute(SetForegroundColor(Color::DarkGrey))?;
+    let context_info = if context_gathered.is_empty() {
+        format!("{} files", file_count)
+    } else {
+        format!("{} files + {}", file_count, context_gathered.join(", "))
+    };
+    stdout.execute(Print(format!(
+        "Model: {} · {}\n",
+        config.ollama_model, context_info
+    )))?;
+    stdout.execute(ResetColor)?;
+
+    // Phase 2: Generation with spinner
     let spinner_idx = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let spinner_idx_clone = spinner_idx.clone();
     let got_first_token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let got_first_token_clone = got_first_token.clone();
-    let start_time = std::time::Instant::now();
+    let gen_start = std::time::Instant::now();
 
     // Start spinner in background
     let spinner_handle = std::thread::spawn(move || {
@@ -340,7 +757,7 @@ fn run_interactive(
         ];
 
         while !got_first_token_clone.load(std::sync::atomic::Ordering::Relaxed) {
-            let elapsed = start_time.elapsed().as_secs_f32();
+            let elapsed = gen_start.elapsed().as_secs_f32();
             let phase_idx = match elapsed {
                 t if t < 0.5 => 0,
                 t if t < 2.0 => 1,
@@ -366,9 +783,8 @@ fn run_interactive(
 
     let mut result = String::new();
     let mut first_token = true;
-    let gen_start = std::time::Instant::now();
 
-    let generation_result = generate_ollama_streaming(config, prompt, |token| {
+    let generation_result = generate_ollama_streaming(config, &prompt, |token| {
         if first_token {
             got_first_token.store(true, std::sync::atomic::Ordering::Relaxed);
             // Clear spinner line
@@ -388,7 +804,7 @@ fn run_interactive(
     got_first_token.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = spinner_handle.join();
 
-    let total_time = gen_start.elapsed().as_secs_f32();
+    let total_time = start_time.elapsed().as_secs_f32();
 
     // If we never got a token, clear spinner
     if first_token {
@@ -510,13 +926,17 @@ Commands:
   init          - Install shell integration
 
 Config keys:
-  ollama_model  - Ollama model name (default: llama3.2)
-  ollama_url    - Ollama API URL (default: http://localhost:11434)
+  ollama_model    - Main model for generation (default: llama3.2)
+  ollama_url      - Ollama API URL (default: http://localhost:11434)
+  router_model    - Small model for context analysis (default: qwen2.5:0.5b)
+  router_enabled  - Enable smart context routing (default: true)
 
 Examples:
   ai "list all files"
+  ai "write a commit message"    # auto-gathers git diff/status
   ai config show
   ai config set ollama_model mistral
+  ai config set router_enabled false
   ai models
   ai init zsh
 "#
@@ -784,9 +1204,11 @@ fn handle_config(args: &[String]) {
 
     if args.is_empty() || args[0] == "show" {
         println!("Current configuration:");
-        println!("  backend:      {}", config.backend);
-        println!("  ollama_model: {}", config.ollama_model);
-        println!("  ollama_url:   {}", config.ollama_url);
+        println!("  backend:        {}", config.backend);
+        println!("  ollama_model:   {}", config.ollama_model);
+        println!("  ollama_url:     {}", config.ollama_url);
+        println!("  router_model:   {}", config.router_model);
+        println!("  router_enabled: {}", config.router_enabled);
         println!("\nConfig file: {}", Config::config_path().display());
         return;
     }
@@ -811,6 +1233,10 @@ fn handle_config(args: &[String]) {
             },
             "ollama_model" => new_config.ollama_model = value.clone(),
             "ollama_url" => new_config.ollama_url = value.clone(),
+            "router_model" => new_config.router_model = value.clone(),
+            "router_enabled" => {
+                new_config.router_enabled = value.to_lowercase() == "true" || value == "1";
+            }
             _ => {
                 eprintln!("Unknown config key: {}", key);
                 std::process::exit(1);
@@ -876,13 +1302,12 @@ fn main() {
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     let files = collect_files();
-    let file_count = files.len();
-    let prompt = build_prompt(&intent, &working_directory, &files);
 
     let config = Config::load();
 
     let raw = if quick_mode {
-        // Quick mode: no TUI, just output the command
+        // Quick mode: no TUI, no routing, just output the command fast
+        let prompt = build_prompt(&intent, &working_directory, &files);
         match generate_ollama_quiet(&config, &prompt) {
             Ok(r) => r,
             Err(e) => {
@@ -891,8 +1316,8 @@ fn main() {
             }
         }
     } else {
-        // Interactive mode with TUI
-        match run_interactive(&intent, &config, &prompt, file_count) {
+        // Interactive mode with TUI and smart routing
+        match run_interactive_with_routing(&intent, &config, &working_directory, &files) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("model error: {}", e);
