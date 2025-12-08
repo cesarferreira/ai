@@ -489,9 +489,15 @@ fn build_prompt_with_context(
         return build_prompt(intent, working_directory, files);
     }
 
-    // Check if this is a commit-related intent
+    // Check if this is a commit-related intent (creating a commit, not viewing commits)
     let intent_lower = intent.to_lowercase();
-    let is_commit = intent_lower.contains("commit");
+    let is_commit = intent_lower.contains("commit")
+        && !intent_lower.contains("show")
+        && !intent_lower.contains("list")
+        && !intent_lower.contains("last")
+        && !intent_lower.contains("recent")
+        && !intent_lower.contains("view")
+        && !intent_lower.contains("history");
 
     if is_commit {
         format!(
@@ -653,9 +659,16 @@ fn run_interactive_with_routing(
             }
         };
 
-        // Fallback: if intent mentions "commit", always gather git context
+        // Fallback: if intent is about creating a commit (not viewing commits), always gather git context
         let intent_lower = intent.to_lowercase();
-        let needs = if intent_lower.contains("commit") && !needs.git_diff && !needs.git_status {
+        let is_creating_commit = intent_lower.contains("commit")
+            && !intent_lower.contains("show")
+            && !intent_lower.contains("list")
+            && !intent_lower.contains("last")
+            && !intent_lower.contains("recent")
+            && !intent_lower.contains("view")
+            && !intent_lower.contains("history");
+        let needs = if is_creating_commit && !needs.git_diff && !needs.git_status {
             if verbose {
                 eprintln!("(Fallback: forcing git context for commit intent)");
             }
