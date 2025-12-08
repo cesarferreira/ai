@@ -436,27 +436,21 @@ fn gather_context(needs: &ContextNeeds) -> String {
 // Router
 // ============================================================================
 
-const ROUTER_PROMPT: &str = r#"You are a context analyzer. Given a user's intent for a shell command, determine what additional context would help generate a better command.
+const ROUTER_PROMPT: &str = r#"Decide if this shell command needs git context. Output JSON only.
 
-Available context types:
-- git_diff: unstaged changes (for commits, reviews, understanding changes)
-- git_diff_staged: staged changes (for commit messages)
-- git_status: current repo status (for commits, status checks)
-- git_log: recent commit history (for commit message style, rebasing)
-- git_branch: list of branches (for branch operations)
-- file_tree: directory structure (for navigation, finding files)
-- read_files: specific files to read (list filenames from the current directory)
+RULES:
+- Default ALL to false
+- git_status/git_diff: ONLY if intent says "commit", "push", "staged", "changes"
+- Most commands need NO context (ffmpeg, curl, find, ls, grep, docker, npm, etc.)
 
-User intent: "{}"
-Current directory: {}
-Files in directory: {}
+Examples:
+- "convert video to mp4" → {"git_diff":false,"git_diff_staged":false,"git_status":false,"git_log":false,"git_branch":false,"file_tree":false,"read_files":[]}
+- "find large files" → {"git_diff":false,"git_diff_staged":false,"git_status":false,"git_log":false,"git_branch":false,"file_tree":false,"read_files":[]}
+- "write commit message" → {"git_diff":false,"git_diff_staged":true,"git_status":true,"git_log":true,"git_branch":false,"file_tree":false,"read_files":[]}
 
-Respond with ONLY a JSON object (no markdown, no explanation). Example:
-{"git_diff": false, "git_diff_staged": true, "git_status": true, "git_log": true, "git_branch": false, "file_tree": false, "read_files": []}
+Intent: "{}"
 
-If no extra context is needed, respond with:
-{"git_diff": false, "git_diff_staged": false, "git_status": false, "git_log": false, "git_branch": false, "file_tree": false, "read_files": []}
-"#;
+JSON:"#;
 
 fn parse_router_response(response: &str) -> ContextNeeds {
     // Try to extract JSON from response
@@ -526,6 +520,7 @@ fn run_interactive_with_routing(
     config: &Config,
     working_directory: &str,
     files: &[String],
+    verbose: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
     let mut stdout = io::stdout();
     let is_tty = atty::is(atty::Stream::Stdout);
@@ -537,6 +532,18 @@ fn run_interactive_with_routing(
         return generate_ollama_quiet(config, &prompt);
     }
 
+    if verbose {
+        eprintln!("\n{}", "=".repeat(60));
+        eprintln!("VERBOSE MODE");
+        eprintln!("{}", "=".repeat(60));
+        eprintln!("Working directory: {}", working_directory);
+        eprintln!("Files in context: {} files", file_count);
+        eprintln!("Router enabled: {}", config.router_enabled);
+        eprintln!("Router model: {}", config.router_model);
+        eprintln!("Main model: {}", config.ollama_model);
+        eprintln!("{}", "=".repeat(60));
+    }
+
     // Show intent
     stdout.execute(SetForegroundColor(Color::White))?;
     stdout.execute(Print(format!("› {}\n", intent)))?;
@@ -545,6 +552,7 @@ fn run_interactive_with_routing(
     let start_time = std::time::Instant::now();
     let mut extra_context = String::new();
     let mut context_gathered: Vec<String> = vec![];
+    let mut router_response_raw = String::new();
 
     // Phase 1: Router (if enabled)
     if config.router_enabled {
@@ -557,14 +565,17 @@ fn run_interactive_with_routing(
 
         // Show analyzing spinner
         let needs = {
-            let file_list = files.join(", ");
-            let prompt = ROUTER_PROMPT
-                .replace("{}", intent)
-                .replacen("{}", working_directory, 1)
-                .replacen("{}", &file_list, 1);
+            let router_prompt = ROUTER_PROMPT.replace("{}", intent);
+
+            if verbose {
+                eprintln!("\n--- ROUTER PROMPT ---");
+                eprintln!("{}", router_prompt);
+                eprintln!("--- END ROUTER PROMPT ---\n");
+            }
 
             let router_model = config.router_model.clone();
             let ollama_url = config.ollama_url.clone();
+            let prompt_clone = router_prompt.clone();
 
             let handle = std::thread::spawn(move || {
                 let url = format!("{}/api/generate", ollama_url);
@@ -575,7 +586,7 @@ fn run_interactive_with_routing(
 
                 let request = OllamaRequest {
                     model: router_model,
-                    prompt,
+                    prompt: prompt_clone,
                     stream: false,
                 };
 
@@ -608,10 +619,21 @@ fn run_interactive_with_routing(
             }
 
             match handle.join() {
-                Ok(Some(response)) => parse_router_response(&response),
+                Ok(Some(response)) => {
+                    router_response_raw = response.clone();
+                    parse_router_response(&response)
+                }
                 _ => ContextNeeds::default(),
             }
         };
+
+        if verbose && !router_response_raw.is_empty() {
+            eprintln!("\n--- ROUTER RESPONSE ---");
+            eprintln!("{}", router_response_raw);
+            eprintln!("--- PARSED AS ---");
+            eprintln!("{:?}", needs);
+            eprintln!("--- END ROUTER RESPONSE ---\n");
+        }
 
         // Clear router line
         stdout.execute(cursor::MoveToColumn(0))?;
@@ -674,6 +696,20 @@ fn run_interactive_with_routing(
         build_prompt_with_context(intent, working_directory, files, &extra_context)
     };
 
+    if verbose {
+        eprintln!("\n--- GATHERED CONTEXT ---");
+        if extra_context.is_empty() {
+            eprintln!("(none)");
+        } else {
+            eprintln!("{}", extra_context);
+        }
+        eprintln!("--- END GATHERED CONTEXT ---\n");
+
+        eprintln!("--- FINAL PROMPT TO {} ---", config.ollama_model);
+        eprintln!("{}", prompt);
+        eprintln!("--- END FINAL PROMPT ---\n");
+    }
+
     // Show model info
     stdout.execute(SetForegroundColor(Color::DarkGrey))?;
     let context_info = if context_gathered.is_empty() {
@@ -729,10 +765,30 @@ fn run_interactive_with_routing(
     });
 
     let mut result = String::new();
-    let mut first_token = true;
+    let mut first_visible_token = true;
+    let mut in_think_block = false;
 
     let generation_result = generate_ollama_streaming(config, &prompt, |token| {
-        if first_token {
+        // Handle deepseek-r1 <think> blocks - don't display them
+        if token.contains("<think>") {
+            in_think_block = true;
+            return;
+        }
+        if token.contains("</think>") {
+            in_think_block = false;
+            return;
+        }
+        if in_think_block {
+            return;
+        }
+
+        // Skip empty tokens
+        let trimmed = token.trim();
+        if trimmed.is_empty() && first_visible_token {
+            return;
+        }
+
+        if first_visible_token {
             got_first_token.store(true, std::sync::atomic::Ordering::Relaxed);
             // Clear spinner line
             let _ = stdout.execute(cursor::MoveToColumn(0));
@@ -740,7 +796,7 @@ fn run_interactive_with_routing(
             let _ = stdout.execute(SetForegroundColor(Color::Green));
             let _ = stdout.execute(Print("› "));
             let _ = stdout.execute(ResetColor);
-            first_token = false;
+            first_visible_token = false;
         }
         let _ = stdout.execute(Print(token));
         let _ = stdout.flush();
@@ -753,8 +809,8 @@ fn run_interactive_with_routing(
 
     let total_time = start_time.elapsed().as_secs_f32();
 
-    // If we never got a token, clear spinner
-    if first_token {
+    // If we never got a visible token, clear spinner
+    if first_visible_token {
         stdout.execute(cursor::MoveToColumn(0))?;
         stdout.execute(terminal::Clear(ClearType::CurrentLine))?;
     } else {
@@ -862,7 +918,7 @@ fn copy_to_clipboard(_text: &str) -> io::Result<()> {
 
 fn print_usage() {
     eprintln!(
-        r#"Usage: ai <intent>
+        r#"Usage: ai [flags] <intent>
        ai config [show|set <key> <value>]
        ai models
        ai init [zsh|bash|fish]
@@ -871,6 +927,12 @@ Commands:
   config        - Show or modify configuration
   models        - List available Ollama models
   init          - Install shell integration
+
+Flags:
+  -V, --verbose - Show detailed debug info (prompts, responses, context)
+  -q, --quick   - Skip routing, no TUI (used by shell integration)
+  -h, --help    - Show this help
+  -v, --version - Show version
 
 Config keys:
   ollama_model    - Main model for generation (default: llama3.2)
@@ -881,6 +943,7 @@ Config keys:
 Examples:
   ai "list all files"
   ai "write a commit message"    # auto-gathers git diff/status
+  ai --verbose "find large files"
   ai config show
   ai config set ollama_model mistral
   ai config set router_enabled false
@@ -1210,9 +1273,13 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Check for --quick flag (quiet mode for shell integration)
+    // Check for flags
     let quick_mode = args.iter().any(|a| a == "--quick" || a == "-q");
-    let args: Vec<String> = args.into_iter().filter(|a| a != "--quick" && a != "-q").collect();
+    let verbose_mode = args.iter().any(|a| a == "--verbose" || a == "-V");
+    let args: Vec<String> = args
+        .into_iter()
+        .filter(|a| a != "--quick" && a != "-q" && a != "--verbose" && a != "-V")
+        .collect();
 
     if args.is_empty() {
         print_usage();
@@ -1255,6 +1322,13 @@ fn main() {
     let raw = if quick_mode {
         // Quick mode: no TUI, no routing, just output the command fast
         let prompt = build_prompt(&intent, &working_directory, &files);
+        if verbose_mode {
+            eprintln!("\n{}", "=".repeat(60));
+            eprintln!("QUICK MODE (no routing)");
+            eprintln!("{}", "=".repeat(60));
+            eprintln!("Model: {}", config.ollama_model);
+            eprintln!("\n--- PROMPT ---\n{}\n--------------\n", prompt);
+        }
         match generate_ollama_quiet(&config, &prompt) {
             Ok(r) => r,
             Err(e) => {
@@ -1264,7 +1338,7 @@ fn main() {
         }
     } else {
         // Interactive mode with TUI and smart routing
-        match run_interactive_with_routing(&intent, &config, &working_directory, &files) {
+        match run_interactive_with_routing(&intent, &config, &working_directory, &files, verbose_mode) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("model error: {}", e);
