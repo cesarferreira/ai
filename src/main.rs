@@ -220,7 +220,9 @@ struct OllamaModelsResponse {
 
 fn list_ollama_models(config: &Config) -> Result<Vec<OllamaModel>, Box<dyn std::error::Error>> {
     let url = format!("{}/api/tags", config.ollama_url);
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()?;
 
     let response = client
         .get(&url)
@@ -250,7 +252,9 @@ where
     F: FnMut(&str),
 {
     let url = format!("{}/api/generate", config.ollama_url);
-    let client = reqwest::blocking::Client::new();
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(300)) // 5 minute timeout
+        .build()?;
 
     let request = OllamaRequest {
         model: config.ollama_model.clone(),
