@@ -304,27 +304,6 @@ fn generate_ollama_quiet(config: &Config, prompt: &str) -> Result<String, Box<dy
     generate_ollama_streaming(config, prompt, |_| {})
 }
 
-fn generate_with_model(
-    config: &Config,
-    model: &str,
-    prompt: &str,
-) -> Result<String, Box<dyn std::error::Error>> {
-    let url = format!("{}/api/generate", config.ollama_url);
-    let client = reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(60)) // 1 minute for router
-        .build()?;
-
-    let request = OllamaRequest {
-        model: model.to_string(),
-        prompt: prompt.to_string(),
-        stream: false,
-    };
-
-    let response = client.post(&url).json(&request).send()?;
-    let result: OllamaResponse = response.json()?;
-    Ok(result.response)
-}
-
 // ============================================================================
 // Context Gatherers
 // ============================================================================
@@ -502,24 +481,6 @@ fn parse_router_response(response: &str) -> ContextNeeds {
     ContextNeeds::default()
 }
 
-fn route_intent(
-    config: &Config,
-    intent: &str,
-    working_directory: &str,
-    files: &[String],
-) -> ContextNeeds {
-    let file_list = files.join(", ");
-    let prompt = ROUTER_PROMPT
-        .replace("{}", intent)
-        .replacen("{}", working_directory, 1)
-        .replacen("{}", &file_list, 1);
-
-    match generate_with_model(config, &config.router_model, &prompt) {
-        Ok(response) => parse_router_response(&response),
-        Err(_) => ContextNeeds::default(),
-    }
-}
-
 fn build_prompt_with_context(
     intent: &str,
     working_directory: &str,
@@ -559,20 +520,6 @@ STRICT RULES:
 // ============================================================================
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-fn show_spinner_phase(stdout: &mut io::Stdout, phase: &str, elapsed: f32, spinner_idx: usize) {
-    let _ = stdout.execute(cursor::MoveToColumn(0));
-    let _ = stdout.execute(terminal::Clear(ClearType::CurrentLine));
-    let _ = stdout.execute(SetForegroundColor(Color::Cyan));
-    let _ = stdout.execute(Print(format!(
-        "{} {}... {:.1}s",
-        SPINNER_FRAMES[spinner_idx % SPINNER_FRAMES.len()],
-        phase,
-        elapsed
-    )));
-    let _ = stdout.execute(ResetColor);
-    let _ = stdout.flush();
-}
 
 fn run_interactive_with_routing(
     intent: &str,
