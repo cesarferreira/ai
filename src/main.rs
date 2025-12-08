@@ -292,7 +292,12 @@ fn generate_ollama_quiet(config: &Config, prompt: &str) -> Result<String, Box<dy
 
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-fn run_interactive(intent: &str, config: &Config, prompt: &str) -> Result<String, Box<dyn std::error::Error>> {
+fn run_interactive(
+    intent: &str,
+    config: &Config,
+    prompt: &str,
+    file_count: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
     let mut stdout = io::stdout();
     let is_tty = atty::is(atty::Stream::Stdout);
 
@@ -301,25 +306,54 @@ fn run_interactive(intent: &str, config: &Config, prompt: &str) -> Result<String
         return generate_ollama_quiet(config, prompt);
     }
 
-    // Show intent
+    // Show context header
     stdout.execute(SetForegroundColor(Color::DarkGrey))?;
+    stdout.execute(Print(format!(
+        "Using {} · {} files in context\n",
+        config.ollama_model, file_count
+    )))?;
+    stdout.execute(ResetColor)?;
+
+    // Show intent
+    stdout.execute(SetForegroundColor(Color::White))?;
     stdout.execute(Print(format!("› {}\n", intent)))?;
     stdout.execute(ResetColor)?;
 
-    // Show spinner while waiting for first token
+    // Spinner state
     let spinner_idx = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let spinner_idx_clone = spinner_idx.clone();
     let got_first_token = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let got_first_token_clone = got_first_token.clone();
+    let start_time = std::time::Instant::now();
 
     // Start spinner in background
     let spinner_handle = std::thread::spawn(move || {
         let mut stdout = io::stdout();
+        let phases = [
+            "Connecting",
+            "Waiting for model",
+            "Generating",
+        ];
+
         while !got_first_token_clone.load(std::sync::atomic::Ordering::Relaxed) {
+            let elapsed = start_time.elapsed().as_secs_f32();
+            let phase_idx = match elapsed {
+                t if t < 0.5 => 0,
+                t if t < 2.0 => 1,
+                _ => 2,
+            };
+            let phase = phases[phase_idx];
+
             let idx = spinner_idx_clone.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % SPINNER_FRAMES.len();
             let _ = stdout.execute(cursor::MoveToColumn(0));
+            let _ = stdout.execute(terminal::Clear(ClearType::CurrentLine));
             let _ = stdout.execute(SetForegroundColor(Color::Cyan));
-            let _ = stdout.execute(Print(format!("{} thinking...", SPINNER_FRAMES[idx])));
+            let _ = stdout.execute(Print(format!(
+                "{} {}... {:.1}s",
+                SPINNER_FRAMES[idx],
+                phase,
+                elapsed
+            )));
             let _ = stdout.execute(ResetColor);
             let _ = stdout.flush();
             std::thread::sleep(std::time::Duration::from_millis(80));
@@ -328,6 +362,7 @@ fn run_interactive(intent: &str, config: &Config, prompt: &str) -> Result<String
 
     let mut result = String::new();
     let mut first_token = true;
+    let gen_start = std::time::Instant::now();
 
     let generation_result = generate_ollama_streaming(config, prompt, |token| {
         if first_token {
@@ -349,13 +384,18 @@ fn run_interactive(intent: &str, config: &Config, prompt: &str) -> Result<String
     got_first_token.store(true, std::sync::atomic::Ordering::Relaxed);
     let _ = spinner_handle.join();
 
+    let total_time = gen_start.elapsed().as_secs_f32();
+
     // If we never got a token, clear spinner
     if first_token {
         stdout.execute(cursor::MoveToColumn(0))?;
         stdout.execute(terminal::Clear(ClearType::CurrentLine))?;
+    } else {
+        // Show timing
+        stdout.execute(SetForegroundColor(Color::DarkGrey))?;
+        stdout.execute(Print(format!(" ({:.1}s)\n", total_time)))?;
+        stdout.execute(ResetColor)?;
     }
-
-    println!(); // newline after response
 
     generation_result?;
 
@@ -832,6 +872,7 @@ fn main() {
         .map(|p| p.display().to_string())
         .unwrap_or_default();
     let files = collect_files();
+    let file_count = files.len();
     let prompt = build_prompt(&intent, &working_directory, &files);
 
     let config = Config::load();
@@ -847,7 +888,7 @@ fn main() {
         }
     } else {
         // Interactive mode with TUI
-        match run_interactive(&intent, &config, &prompt) {
+        match run_interactive(&intent, &config, &prompt, file_count) {
             Ok(r) => r,
             Err(e) => {
                 eprintln!("model error: {}", e);
