@@ -440,13 +440,15 @@ const ROUTER_PROMPT: &str = r#"Decide if this shell command needs git context. O
 
 RULES:
 - Default ALL to false
-- git_status/git_diff: ONLY if intent says "commit", "push", "staged", "changes"
-- Most commands need NO context (ffmpeg, curl, find, ls, grep, docker, npm, etc.)
+- Set git_diff=true, git_status=true, git_log=true if intent mentions: "commit", "add and commit", "commit message", "push", "what changed"
+- Most commands need NO context (ffmpeg, curl, find, ls, grep, docker, npm, convert, compress, etc.)
 
 Examples:
 - "convert video to mp4" → {"git_diff":false,"git_diff_staged":false,"git_status":false,"git_log":false,"git_branch":false,"file_tree":false,"read_files":[]}
 - "find large files" → {"git_diff":false,"git_diff_staged":false,"git_status":false,"git_log":false,"git_branch":false,"file_tree":false,"read_files":[]}
-- "write commit message" → {"git_diff":false,"git_diff_staged":true,"git_status":true,"git_log":true,"git_branch":false,"file_tree":false,"read_files":[]}
+- "commit my work" → {"git_diff":true,"git_diff_staged":false,"git_status":true,"git_log":true,"git_branch":false,"file_tree":false,"read_files":[]}
+- "add and commit" → {"git_diff":true,"git_diff_staged":false,"git_status":true,"git_log":true,"git_branch":false,"file_tree":false,"read_files":[]}
+- "add all and commit my changes" → {"git_diff":true,"git_diff_staged":false,"git_status":true,"git_log":true,"git_branch":false,"file_tree":false,"read_files":[]}
 
 Intent: "{}"
 
@@ -487,8 +489,31 @@ fn build_prompt_with_context(
         return build_prompt(intent, working_directory, files);
     }
 
-    format!(
-        r#"You are a CLI assistant. Convert the user's intent into a single shell command.
+    // Check if this is a commit-related intent
+    let intent_lower = intent.to_lowercase();
+    let is_commit = intent_lower.contains("commit");
+
+    if is_commit {
+        format!(
+            r#"You are a CLI assistant. Generate a git commit command with a meaningful commit message.
+
+Current directory: {}
+
+{}
+
+Based on the changes above, write a SINGLE git commit command with a descriptive commit message.
+The message should summarize WHAT changed and WHY (if apparent).
+
+RULES:
+- Output ONLY: git commit -m "your message here"
+- Message should be concise but descriptive (not just "Update" or "Changes")
+- NO markdown, NO backticks, NO explanations
+- ONE single line only"#,
+            working_directory, extra_context
+        )
+    } else {
+        format!(
+            r#"You are a CLI assistant. Convert the user's intent into a single shell command.
 
 Current directory: {}
 Files:
@@ -505,8 +530,9 @@ STRICT RULES:
 - NO explanations, NO comments, NO alternatives
 - ONE single line command only
 - Do NOT wrap in quotes or backticks"#,
-        working_directory, file_list, extra_context, intent
-    )
+            working_directory, file_list, extra_context, intent
+        )
+    }
 }
 
 // ============================================================================
@@ -625,6 +651,22 @@ fn run_interactive_with_routing(
                 }
                 _ => ContextNeeds::default(),
             }
+        };
+
+        // Fallback: if intent mentions "commit", always gather git context
+        let intent_lower = intent.to_lowercase();
+        let needs = if intent_lower.contains("commit") && !needs.git_diff && !needs.git_status {
+            if verbose {
+                eprintln!("(Fallback: forcing git context for commit intent)");
+            }
+            ContextNeeds {
+                git_diff: true,
+                git_status: true,
+                git_log: true,
+                ..needs
+            }
+        } else {
+            needs
         };
 
         if verbose && !router_response_raw.is_empty() {
@@ -849,11 +891,52 @@ fn clean_command(raw: &str) -> String {
     // Remove inline backticks
     cmd = cmd.replace('`', "");
 
-    // Take only the first line (ignore any explanations)
-    cmd = cmd.lines().next().unwrap_or("").to_string();
+    // Try to find an actual command line (starts with common commands)
+    let command_starters = [
+        "git ", "cd ", "ls ", "find ", "grep ", "cat ", "echo ", "mkdir ", "rm ", "cp ", "mv ",
+        "curl ", "wget ", "ssh ", "docker ", "npm ", "yarn ", "pip ", "brew ", "cargo ",
+        "make ", "python ", "node ", "ruby ", "go ", "rustc ", "gcc ", "ffmpeg ", "tar ",
+        "zip ", "unzip ", "chmod ", "chown ", "sudo ", "apt ", "yum ", "pacman ",
+    ];
 
-    // Clean up whitespace
-    cmd.replace('\r', "").trim().to_string()
+    for line in cmd.lines() {
+        let trimmed = line.trim();
+        // Check if line starts with a known command
+        for starter in &command_starters {
+            if trimmed.starts_with(starter) {
+                return trimmed.to_string();
+            }
+        }
+        // Also check for commands with paths like /usr/bin/git
+        if trimmed.starts_with('/') && trimmed.contains(' ') {
+            return trimmed.to_string();
+        }
+    }
+
+    // Fallback: take the first non-empty line that doesn't look like prose
+    for line in cmd.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        // Skip lines that look like explanations (start with common prose patterns)
+        let prose_starters = [
+            "here ", "this ", "the ", "a ", "an ", "to ", "for ", "it ", "i ",
+            "note", "warning", "error", "output", "*", "-", "#",
+        ];
+        let lower = trimmed.to_lowercase();
+        let is_prose = prose_starters.iter().any(|s| lower.starts_with(s));
+        if !is_prose {
+            return trimmed.replace('\r', "");
+        }
+    }
+
+    // Last resort: first line
+    cmd.lines()
+        .next()
+        .unwrap_or("")
+        .trim()
+        .replace('\r', "")
 }
 
 // ============================================================================
