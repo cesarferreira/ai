@@ -153,7 +153,7 @@ impl Config {
         dirs::home_dir()
             .unwrap_or_default()
             .join(".config")
-            .join("ai")
+            .join("term-mate")
     }
 
     fn config_path() -> PathBuf {
@@ -1001,10 +1001,10 @@ fn copy_to_clipboard(_text: &str) -> io::Result<()> {
 
 fn print_usage() {
     eprintln!(
-        r#"Usage: ai [flags] <intent>
-       ai config [show|set <key> <value>]
-       ai models
-       ai init [zsh|bash|fish]
+        r#"Usage: mate [flags] <intent>
+       mate config [show|set <key> <value>]
+       mate models
+       mate init [zsh|bash|fish]
 
 Commands:
   config        - Show or modify configuration
@@ -1024,14 +1024,14 @@ Config keys:
   router_enabled  - Enable smart context routing (default: true)
 
 Examples:
-  ai "list all files"
-  ai "write a commit message"    # auto-gathers git diff/status
-  ai --verbose "find large files"
-  ai config show
-  ai config set ollama_model mistral
-  ai config set router_enabled false
-  ai models
-  ai init zsh
+  mate "list all files"
+  mate "write a commit message"    # auto-gathers git diff/status
+  mate --verbose "find large files"
+  mate config show
+  mate config set ollama_model mistral
+  mate config set router_enabled false
+  mate models
+  mate init zsh
 "#
     );
 }
@@ -1055,7 +1055,7 @@ fn handle_models() {
                 };
                 println!("  {} ({}){}", model.name, format_size(model.size), current);
             }
-            println!("\nSet model with: ai config set ollama_model <name>");
+            println!("\nSet model with: mate config set ollama_model <name>");
         }
         Err(e) => {
             eprintln!("Failed to list models: {}", e);
@@ -1069,8 +1069,8 @@ fn handle_models() {
 // Shell Integration
 // ============================================================================
 
-const ZSH_INTEGRATION: &str = r#"# ai shell integration
-_ai_is_safe() {
+const ZSH_INTEGRATION: &str = r#"# mate shell integration
+_mate_is_safe() {
   local cmd="${1}"
   local lowered="${cmd:l}"
   if [[ "${lowered}" == *"rm -rf /"* || "${lowered}" == *"rm -rf *"* ]]; then
@@ -1085,29 +1085,30 @@ _ai_is_safe() {
   return 0
 }
 
-_ai_widget() {
+_mate_widget() {
   local intent="${BUFFER}"
   if [[ -z "${intent}" ]]; then
     intent="suggest a useful command for this directory"
   fi
 
-  # Clear current line and run ai with TUI on /dev/tty, capture result
+  # Clear current line and run mate with TUI on /dev/tty, capture result
   zle -I  # invalidate display
-  echo ""  # newline before ai output
+  echo ""  # newline before mate output
 
   local suggestion exit_code
-  suggestion=$(ai --quick "${intent}" 2>/dev/null </dev/tty)
+  suggestion=$(mate --quick "${intent}" 2>/dev/null </dev/tty)
   exit_code=$?
 
   case "${exit_code}" in
     0) ;;
-    1) zle -M "ai: missing intent"; return ;;
-    2) zle -M "ai: blocked dangerous command"; return ;;
-    *) zle -M "ai: error (${exit_code})"; return ;;
+    1) zle -M "mate: missing intent"; return ;;
+    2) zle -M "mate: blocked dangerous command"; return ;;
+    3) zle -M "mate: model error"; return ;;
+    *) zle -M "mate: error (${exit_code})"; return ;;
   esac
 
-  if ! _ai_is_safe "${suggestion}"; then
-    zle -M "ai: blocked dangerous command"
+  if ! _mate_is_safe "${suggestion}"; then
+    zle -M "mate: blocked dangerous command"
     return
   fi
 
@@ -1116,12 +1117,12 @@ _ai_widget() {
   zle redisplay
 }
 
-zle -N ai-widget _ai_widget
-bindkey '^G' ai-widget
+zle -N mate-widget _mate_widget
+bindkey '^G' mate-widget
 "#;
 
-const BASH_INTEGRATION: &str = r#"# ai shell integration
-_ai_is_safe() {
+const BASH_INTEGRATION: &str = r#"# mate shell integration
+_mate_is_safe() {
   local cmd="$1"
   local lowered="${cmd,,}"
   if [[ "$lowered" == *"rm -rf /"* || "$lowered" == *"rm -rf *"* ]]; then
@@ -1133,21 +1134,21 @@ _ai_is_safe() {
   return 0
 }
 
-_ai_suggest() {
+_mate_suggest() {
   local intent="$READLINE_LINE"
   if [[ -z "$intent" ]]; then
     intent="suggest a useful command for this directory"
   fi
 
   local suggestion exit_code
-  suggestion=$(ai "$intent" 2>/dev/null)
+  suggestion=$(mate "$intent" 2>/dev/null)
   exit_code=$?
 
   if [[ $exit_code -ne 0 ]]; then
     return
   fi
 
-  if ! _ai_is_safe "$suggestion"; then
+  if ! _mate_is_safe "$suggestion"; then
     return
   fi
 
@@ -1155,11 +1156,11 @@ _ai_suggest() {
   READLINE_POINT=${#READLINE_LINE}
 }
 
-bind -x '"\C-g": _ai_suggest'
+bind -x '"\C-g": _mate_suggest'
 "#;
 
-const FISH_INTEGRATION: &str = r#"# ai shell integration
-function _ai_is_safe
+const FISH_INTEGRATION: &str = r#"# mate shell integration
+function _mate_is_safe
   set -l cmd $argv[1]
   set -l lowered (string lower $cmd)
   if string match -q "*rm -rf /*" $lowered; or string match -q "*rm -rf \\**" $lowered
@@ -1171,20 +1172,20 @@ function _ai_is_safe
   return 0
 end
 
-function _ai_suggest
+function _mate_suggest
   set -l intent (commandline)
   if test -z "$intent"
     set intent "suggest a useful command for this directory"
   end
 
-  set -l suggestion (ai "$intent" 2>/dev/null)
+  set -l suggestion (mate "$intent" 2>/dev/null)
   set -l exit_code $status
 
   if test $exit_code -ne 0
     return
   end
 
-  if not _ai_is_safe "$suggestion"
+  if not _mate_is_safe "$suggestion"
     return
   end
 
@@ -1192,7 +1193,7 @@ function _ai_suggest
   commandline -f end-of-line
 end
 
-bind \cg _ai_suggest
+bind \cg _mate_suggest
 "#;
 
 fn get_shell_rc_path(shell: &str) -> Option<PathBuf> {
@@ -1272,7 +1273,7 @@ fn handle_init(args: &[String]) {
     }
 
     // Append source line to rc file
-    let addition = format!("\n# ai\n{}\n", source_line);
+    let addition = format!("\n# mate\n{}\n", source_line);
     if let Err(e) = fs::OpenOptions::new()
         .append(true)
         .create(true)
@@ -1289,7 +1290,7 @@ fn handle_init(args: &[String]) {
     println!("Integration file: {}", integration_path.display());
     println!("\nRun this to activate now:");
     println!("  source \"{}\"", rc_path.display());
-    println!("\nThen press Ctrl+G to trigger AI suggestions!");
+    println!("\nThen press Ctrl+G to trigger term-mate suggestions!");
 }
 
 fn handle_config(args: &[String]) {
@@ -1308,7 +1309,7 @@ fn handle_config(args: &[String]) {
 
     if args[0] == "set" {
         if args.len() < 3 {
-            eprintln!("Usage: ai config set <key> <value>");
+            eprintln!("Usage: mate config set <key> <value>");
             std::process::exit(1);
         }
 
@@ -1376,7 +1377,7 @@ fn main() {
             return;
         }
         "-v" | "--version" | "version" => {
-            println!("ai {}", env!("CARGO_PKG_VERSION"));
+            println!("term-mate {}", env!("CARGO_PKG_VERSION"));
             return;
         }
         "config" => {

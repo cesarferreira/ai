@@ -3,19 +3,6 @@
 version = 4
 
 [[package]]
-name = "ai"
-version = "0.1.0"
-dependencies = [
- "atty",
- "crossterm",
- "dirs",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
-]
-
-[[package]]
 name = "atty"
 version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1110,6 +1097,19 @@ dependencies = [
  "once_cell",
  "rustix 1.1.2",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "term-mate"
+version = "0.1.0"
+dependencies = [
+ "atty",
+ "crossterm",
+ "dirs",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
 ]
 
 [[package]]

@@ -1,7 +1,12 @@
 [package]
-name = "ai"
+name = "term-mate"
 version = "0.1.0"
 edition = "2021"
+default-run = "mate"
+
+[[bin]]
+name = "mate"
+path = "src/main.rs"
 
 [dependencies]
 reqwest = { version = "0.11", features = ["json", "blocking", "stream"] }
