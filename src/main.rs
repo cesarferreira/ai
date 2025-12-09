@@ -713,12 +713,13 @@ async fn run_interactive_with_routing(
             && !intent_lower.contains("recent")
             && !intent_lower.contains("view")
             && !intent_lower.contains("history");
-        let needs = if is_creating_commit && !needs.git_diff && !needs.git_status {
+        let needs = if is_creating_commit {
             if verbose {
-                eprintln!("(Fallback: forcing git context for commit intent)");
+                eprintln!("(Commit intent: forcing git diff, staged diff, status, log)");
             }
             ContextNeeds {
                 git_diff: true,
+                git_diff_staged: true,
                 git_status: true,
                 git_log: true,
                 ..needs
